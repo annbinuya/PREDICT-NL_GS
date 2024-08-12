@@ -1,0 +1,362 @@
+---
+title: "Table and figure for predicted vs observed events"
+author: "Mary Ann Binuya"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+  pdf_document: default
+---
+
+# Aim(s)
+1. To assess performance increment by observing predicted and observed risks at levels of prognostic variables
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = FALSE,
+  fig.retina = 3,
+  fig.path = "Output/5 PREDICT P-O/")
+
+#Load libraries
+library(dplyr) #for data manipulations
+library(survival) #for calculating survival predictions
+library(writexl) #for exporting to excel
+library(table1) #for table 1
+library(ggplot2) #for plot
+
+rm(list=ls())
+```
+
+# Load data
+```{r Load}
+# Load predicted risks
+  load("WS_3_PREDICT_validation.RData")
+
+  dat2 <- risk_df
+  dat2$m_bc <- dat2$predicted_risk
+  dat2[,"predicted_risk"] <- NULL
+  
+  load("WS_4_PREDICT-GS_validation.RData")
+
+  dat2$m_bc_g7 <- form1g7_riskdf$predicted_risk
+  
+  rm(list=setdiff(ls(), c("dat2")))
+  
+# Combine with original data
+  load("WS_1_Data_Prep_NKR.RData")
+  
+  dat <- cbind(dat2,
+    datapredimp_bc %>%
+    filter(.imp==0) %>%
+    select(age.start, #Age at diagnosis
+           screen, #Detected during screening
+           size, #Tumor size
+           grade, #Tumor grade
+           nodes, #Number of nodes
+           pr, #Progesterone status
+           her2, #HER2 status
+           generation, #Chemotherapy generation
+           horm, #Hormone therapy
+           traz, #Trastuzumab (anti-HER2 therapy)
+           bis, #Bisphosphonates
+           grisk)) %>% #Genomic risk (MammaPrint)
+    mutate(
+      sizecat = case_when(
+        (size < 10) ~ 1,
+        (size <= 19) & (size >= 10) ~ 2,
+        (size > 19) ~ 3,
+        is.na(size) ~ 9),
+      agecat = ifelse(age.start >= 50, 1, 0),
+      nodescat = ifelse(nodes >3, "4+", nodes))
+
+  rm(list=setdiff(ls(), c("dat")))
+  
+# Format data
+  dat$pr <- ifelse(is.na(dat$pr), 9, as.numeric(dat$pr)-1)
+  dat$her2 <- ifelse(is.na(dat$her2), 9, as.numeric(dat$her2)-1)
+  dat$nodescat <- ifelse(is.na(dat$nodescat), 9, dat$nodescat)
+  dat$grade <- ifelse(is.na(dat$grade), 9, dat$grade)
+  dat[, c("agecat", "sizecat", "grade", "pr", "her2")] <- lapply(dat[, c("agecat", "sizecat", "grade", "pr", "her2")] , FUN=as.factor)
+  dat$nodescat <- as.factor(as.matrix(dat$nodescat))
+  
+  str(dat)
+```
+
+# Calculate observed mortality at each level of clinical characteristics
+```{r Obsrisk}
+obs <- survfit(Surv(time, eventbc) ~ 1, data = dat)
+obs_m <- summary(obs, times = 5, extend = T)$n.event  #43 events at 5 years
+
+# age (order: agecat 0, 1)
+obs_age <- survfit(Surv(time, eventbc) ~ agecat, data = dat)
+obs_m_age <- summary(obs_age, times = 5, extend = T)$n.event
+
+# screen (order: 0, 1)
+obs_screen <- survfit(Surv(time, eventbc) ~ screen, data = dat)
+obs_m_screen <- summary(obs_screen, times = 5, extend = T)$n.event
+
+# size (order: sizecat 1, 2, 3, 9)
+obs_size <- survfit(Surv(time, eventbc) ~ sizecat, data = dat)
+obs_m_size <- summary(obs_size, times = 5, extend = T)$n.event
+
+# grade (order: grade 1, 2, 3, 9) 
+obs_grade <- survfit(Surv(time, eventbc) ~ grade, data = dat)
+obs_m_grade <- summary(obs_grade, times = 5, extend = T)$n.event
+
+# nodes (order: 0, 1, 2, 3, 4+, 9)
+obs_nodes <- survfit(Surv(time, eventbc) ~ nodescat, data = dat)
+obs_m_nodes <- summary(obs_nodes, times = 5, extend = T)$n.event
+
+# pr (order: 0, 1, 9)
+obs_pr <- survfit(Surv(time, eventbc) ~ pr, data = dat)
+obs_m_pr <- summary(obs_pr, times = 5, extend = T)$n.event
+
+# her2 (order: 0, 1, 9)
+obs_her2 <- survfit(Surv(time, eventbc) ~ her2, data = dat)
+obs_m_her2 <- summary(obs_her2, times = 5, extend = T)$n.event
+
+# chemo gen (order: 0, 2, 3)
+obs_gen <- survfit(Surv(time, eventbc) ~ generation, data = dat)
+obs_m_gen <- summary(obs_gen, times = 5, extend = T)$n.event
+
+# horm (order: 0, 1)
+obs_horm <- survfit(Surv(time, eventbc) ~ horm, data = dat)
+obs_m_horm <- summary(obs_horm, times = 5, extend = T)$n.event
+
+# traz (order: 0, 1)
+obs_traz <- survfit(Surv(time, eventbc) ~ traz, data = dat)
+obs_m_traz <- summary(obs_traz, times = 5, extend = T)$n.event
+
+# bis (order: 0, 1)
+obs_bis <- survfit(Surv(time, eventbc) ~ bis, data = dat)
+obs_m_bis <- summary(obs_bis, times = 5, extend = T)$n.event
+
+# genomic risk (order: 0, 1)
+obs_grisk <- survfit(Surv(time, eventbc) ~ grisk, data = dat)
+obs_m_grisk <- summary(obs_grisk, times = 5, extend = T)$n.event
+
+obs_m_age <- as.data.frame(obs_m_age)
+obs_m_screen <- as.data.frame(obs_m_screen)
+obs_m_size <- as.data.frame(obs_m_size)
+obs_m_grade <- as.data.frame(obs_m_grade)
+obs_m_nodes <- as.data.frame(obs_m_nodes)
+obs_m_pr <- as.data.frame(obs_m_pr)
+obs_m_her2 <- as.data.frame(obs_m_her2)
+obs_m_gen <- as.data.frame(obs_m_gen)
+obs_m_horm <- as.data.frame(obs_m_horm)
+obs_m_traz <- as.data.frame(obs_m_traz)
+obs_m_bis <- as.data.frame(obs_m_bis)
+obs_m_grisk <- as.data.frame(obs_m_grisk)
+
+colnames(obs_m_age) <- "varlevels"
+colnames(obs_m_screen) <- "varlevels"
+colnames(obs_m_size) <- "varlevels"
+colnames(obs_m_grade) <- "varlevels"
+colnames(obs_m_nodes) <- "varlevels"
+colnames(obs_m_pr) <- "varlevels"
+colnames(obs_m_her2) <- "varlevels"
+colnames(obs_m_gen) <- "varlevels"
+colnames(obs_m_horm) <- "varlevels"
+colnames(obs_m_traz) <- "varlevels"
+colnames(obs_m_bis) <- "varlevels"
+colnames(obs_m_grisk) <- "varlevels"
+
+empty_df <- data.frame("")
+colnames(empty_df) <- "varlevels"
+
+obsperlevel <- rbind(obs_m, empty_df, obs_m_age, empty_df, obs_m_screen,
+    empty_df, obs_m_size, empty_df, obs_m_grade, empty_df, obs_m_nodes,
+    empty_df, obs_m_pr, empty_df, obs_m_her2, empty_df, obs_m_gen, empty_df,
+    obs_m_horm, empty_df, obs_m_traz, empty_df, obs_m_bis, empty_df,
+    obs_m_grisk)
+colnames(obsperlevel) <- "o_bc"
+rm(empty_df)
+rm(list = ls(pattern = "^obs_"))
+```
+
+# Calculate predicted mortality at each level of clinical characteristics
+```{r PO}
+pred1 <- mean(dat$m_bc)
+pred7 <- mean(dat$m_bc_g7)
+
+dat_age <- dat %>%
+    group_by(agecat) %>%
+    summarise(p_bc = mean(m_bc), p_bc_g7 = mean(m_bc_g7))
+
+dat_screen <- dat %>%
+    group_by(screen) %>%
+    summarise(p_bc = mean(m_bc), p_bc_g7 = mean(m_bc_g7))
+
+dat_size <- dat %>%
+    group_by(sizecat) %>%
+    summarise(p_bc = mean(m_bc), p_bc_g7 = mean(m_bc_g7))
+
+dat_grade <- dat %>%
+    group_by(grade) %>%
+    summarise(p_bc = mean(m_bc), p_bc_g7 = mean(m_bc_g7))
+
+dat_nodes <- dat %>%
+    group_by(nodescat) %>%
+    summarise(p_bc = mean(m_bc), p_bc_g7 = mean(m_bc_g7))
+
+dat_pr <- dat %>%
+    group_by(pr) %>%
+    summarise(p_bc = mean(m_bc), p_bc_g7 = mean(m_bc_g7))
+
+dat_her2 <- dat %>%
+    group_by(her2) %>%
+    summarise(p_bc = mean(m_bc), p_bc_g7 = mean(m_bc_g7))
+
+dat_gen <- dat %>%
+    group_by(generation) %>%
+    summarise(p_bc = mean(m_bc), p_bc_g7 = mean(m_bc_g7))
+
+dat_horm <- dat %>%
+    group_by(horm) %>%
+    summarise(p_bc = mean(m_bc), p_bc_g7 = mean(m_bc_g7))
+
+dat_traz <- dat %>%
+    group_by(traz) %>%
+    summarise(p_bc = mean(m_bc), p_bc_g7 = mean(m_bc_g7))
+
+dat_bis <- dat %>%
+    group_by(bis) %>%
+    summarise(p_bc = mean(m_bc), p_bc_g7 = mean(m_bc_g7))
+
+dat_grisk <- dat %>%
+    group_by(grisk) %>%
+    summarise(p_bc = mean(m_bc), p_bc_g7 = mean(m_bc_g7))
+
+colnames(dat_age)[1] <- "varlevels"
+colnames(dat_screen)[1] <- "varlevels"
+colnames(dat_size)[1] <- "varlevels"
+colnames(dat_grade)[1] <- "varlevels"
+colnames(dat_nodes)[1] <- "varlevels"
+colnames(dat_pr)[1] <- "varlevels"
+colnames(dat_her2)[1] <- "varlevels"
+colnames(dat_gen)[1] <- "varlevels"
+colnames(dat_horm)[1] <- "varlevels"
+colnames(dat_traz)[1] <- "varlevels"
+colnames(dat_bis)[1] <- "varlevels"
+colnames(dat_grisk)[1] <- "varlevels"
+
+first_row <- cbind("", pred1, pred7)
+empty_df <- data.frame("", "", "")
+colnames(first_row) <- colnames(dat_age)
+colnames(empty_df) <- colnames(dat_age)
+predperlevel <- rbind(first_row, empty_df, dat_age, empty_df, dat_screen,
+    empty_df, dat_size, empty_df, dat_grade, empty_df, dat_nodes, empty_df,
+    dat_pr, empty_df, dat_her2, empty_df, dat_gen, empty_df, dat_horm, empty_df,
+    dat_traz, empty_df, dat_bis, empty_df, dat_grisk)
+rm(first_row, empty_df)
+rm(list = ls(pattern = "^dat_"))
+```
+
+# Create table
+```{r Table}
+# Add levels
+  levels(dat$agecat) <- c("< 50 years", ">= 50 years")
+  levels(dat$screen) <- c("No or unknown", "Yes")
+  levels(dat$sizecat) <- c("< 10 mm", "10-19 mm", "> 19 mm", "Missing")
+  levels(dat$grade) <- c("Well differentiated", "Moderately differentiated", "Poorly differentiated", "Missing")
+  levels(dat$nodescat) <- c("Node-negative", "1 positive lymph node", "2 positive lymph nodes", "3 positive lymph nodes", "4+ positive lymph nodes", "Missing")
+  levels(dat$pr) <- c("Negative", "Positive", "Missing")
+  levels(dat$her2) <- c("Negative", "Positive", "Missing")
+  levels(dat$generation) <- c("No", "Second generation", "Third generation")
+  levels(dat$horm) <- c("No", "Yes")
+  levels(dat$traz) <- c("No", "Yes")
+  levels(dat$bis) <- c("No", "Yes")
+  levels(dat$grisk) <- c("Low", "High")
+
+# Add labels
+  labels <- list(variables = list(
+      agecat = "Age at diagnosis (years)",
+      screen = "Detected during screening",
+      sizecat = "Tumor size (mm)",
+      grade = "Tumor grade",
+      nodescat = "Number of positive nodes",
+      pr = "Progesterone status",
+      her2 = "HER2 status",
+      generation = "Chemotherapy generation",
+      horm = "Hormone therapy",
+      traz = "Trastuzumab therapy",
+      bis = "Bisphosphonates",
+      grisk = "Genomic risk (MammaPrint)"))
+
+# Create base table
+  strata <- c(list(Total = dat))
+  
+  tab1 <- as.data.frame(table1(strata, labels, data = dat))
+  
+  tab1$numobs <- gsub("\\s*\\(.*\\)\\s*", "", tab1$Total)
+  tab1$numobs[1] <- nrow(dat)
+  
+# Calculate predicted BC deaths
+  tab2 <- cbind(tab1, obsperlevel, predperlevel)
+  tab2$obs_bc <- tab2$o_bc
+  tab2$pred_bc <- ifelse(tab2$numobs != "", round(as.numeric(tab2$numobs) *
+      as.numeric(tab2$p_bc), 0), "")
+  tab2$pred_bc_g7 <- ifelse(tab2$numobs != "", round(as.numeric(tab2$numobs) *
+      as.numeric(tab2$p_bc_g7), 0), "")
+
+  table <- tab2[, c(1, 3, 8:10)]
+  write_xlsx(table, "Data/table_predicted_observed.xlsx")
+  
+  rm(tab1, tab2, pred1, pred7, strata, labels, obs)
+```
+
+# Plot
+```{r Plot, fig.height=5, fig.width=10}
+data <- table[-1,] %>% select(-numobs) %>%
+  rename(Observed=obs_bc, PREDICTv2.3=pred_bc, `PREDICT-GS`=pred_bc_g7)
+
+data$Varnames <- c(rep("Age", 3),
+                   rep("Screen-detected", 3),
+                   rep("Size", 5),
+                   rep("Grade", 5),
+                   rep("Nodes", 7),
+                   rep("PR", 4),
+                   rep("HER2", 4),
+                   rep("Chemotherapy", 4),
+                   rep("Endocrine therapy", 3),
+                   rep("Trastuzumab therapy", 3),
+                   rep("Bisphosphonates", 3),
+                   rep("70-gene signature", 3)) #changed label for text consistency
+data <- data %>% filter(Observed!="")
+data$Levels <- data[,1]
+
+data <- data[,-1]
+
+data <- data %>%
+  filter(!grepl("Missing", Levels, ignore.case = TRUE))
+
+data_long <- data %>%
+  tidyr::pivot_longer(
+  cols = c(Observed, PREDICTv2.3, `PREDICT-GS`),
+  names_to = "Group", 
+  values_to = "Value") %>%
+  select(Varnames, Levels, Group, Value)
+
+data_long$Value <- as.numeric(data_long$Value)
+data_long$Var_levels <- paste0(data_long$Varnames, ": ", data_long$Levels, sep = "")
+
+ggplot(data_long, aes(x=Var_levels, y=Value, fill=Group)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  labs(title = "N=3323",
+       x = "", 
+       y = "Breast cancer deaths at 5 years") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 1, size = 8),
+        axis.text.y = element_text(size = 8),
+        axis.title.y = element_text(margin = margin(r=10, unit="pt"), size = 8),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size = 8)) +#,
+        #legend.position = "top") +
+  scale_fill_manual(values = c("Observed" = "lightgray", "PREDICTv2.3" = "gray40","PREDICT-GS" = "blue")) +
+  scale_y_continuous(breaks = seq(0, max(data_long$Value) + 2, by = 5))
+
+# save.image("WS_5_PREDICT_P-O.RData")
+```

@@ -1,0 +1,294 @@
+---
+title: "External validation of PREDICT-GS (PREDICT with Mammaprint) on the NKR dataset"
+author: "Mary Ann Binuya"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+  pdf_document: default
+---
+
+# Aims
+1. To externally validate PREDICT-GS on the imputed NKR dataset and assess performance increment compared to PREDICTv2.3
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = FALSE,
+  fig.retina = 4,
+  fig.path = "Output/4 PREDICT - extension/")
+
+#Load libraries
+library(dplyr) #for data manipulations
+library(survival) #for survival analysis
+library(rms) #for survival analysis
+library(timeROC) #for timeAUC
+library(writexl) #for exporting to excel
+
+rm(list=ls())
+```
+
+# Load data
+```{r Load}
+# Load data and results of original model's external validation
+  load("WS_3_PREDICT_validation.RData")
+  
+  form0_res <- NKR_res[1:3]
+  form0_riskdf <- NKR_res[[4]]
+
+  rm(list = setdiff(ls(), c("dat",
+                            "pool_estimates", "calplot_fn", "nb_fn_TP", "nb_fn_TN", #relevant functions
+                            "form0_res", "form0_riskdf", "form0_nb_TP", "form0_nb_TN"))) #results of PREDICT validation
+
+  dat$grisk <- as.numeric(as.character(dat$grisk))
+  
+  nimp <- max(dat$.imp)
+
+# Derive predicted survival
+  tmax <- 5
+
+  # Prognostic index
+  dat$pi_g7 <- dat$pirx + 0.7 * dat$grisk
+  
+  # Baseline survival (recalibrate)
+  fit <- coxph(Surv(time, eventbc) ~ offset(pi_g7), data = dat)
+  bhaz <- basehaz(fit)
+  bhaz_NKR <- max(bhaz$hazard[bhaz$time <= tmax]) #baseline cumhaz
+  round(bhaz_NKR, 8) #0.01060378
+  bsurv_form1g7 <- exp(-bhaz_NKR) #baseline survival
+  rm(fit, bhaz, bhaz_NKR)
+  
+  # Predicted risks
+  dat$bcss_g7 <- bsurv_form1g7^(exp(dat$pi_g7))
+```
+
+# Model performance at 5 years
+```{r Perfstats}
+# Calculate performance metrics for each imputed dataset
+  perf_g7 <- function(dataframe) {
+    perf_stats <- matrix(NA, nimp, 6)
+    risk_list <- vector("list", nimp)
+  
+    for (i in 1:nimp) {
+      
+      data <- dataframe[dataframe[".imp"] == i, ]
+      data$subject <- seq_len(nrow(data))
+      
+      f <- coxph(Surv(time, eventbc) ~ pi_g7, x = TRUE, y = TRUE, data = data)
+      
+      # Discrimination
+      auc_temp <- timeROC(
+        T = data$time,
+        delta = data$oscr,
+        cause = 1,
+        marker = 1 - data$bcss_g7,
+        weighting = "marginal",
+        times = tmax,
+        iid = TRUE)
+      auc_stats <- as.numeric(auc_temp$AUC_2[2])
+      se_auc_stats <- as.numeric(auc_temp$inference$vect_sd_2[2])
+      
+      # Calibration slope
+      cs_stats <- f$coefficients
+      se_cs_stats <- sqrt(diag(vcov(f)))
+      
+      # Calibration-in-the-large
+        # Observed risk at tmax
+        surv_fit <- survfit(Surv(data$time, data$eventbc) ~ 1)
+        obs_risk <- 1 - summary(surv_fit, times = tmax)$surv
+        obs_se <- summary(surv_fit, times = tmax)$std.err
+        obs_lrisk <- 1 - summary(surv_fit, times = tmax)$upper
+        obs_urisk <- 1 - summary(surv_fit, times = tmax)$lower
+        
+        # Predicted risk at tmax
+        data$predrisk <- 1 - data$bcss_g7
+        exp_risk <- mean(data$predrisk)
+        
+        # O/E ratio
+        OE_stats <- obs_risk/exp_risk
+        se_OE_stats <- obs_se/obs_risk #if log transformation is required (see Debray et al, 2017 for formula)
+        #se_OE_stats <- obs_se / exp_risk #if log transformation not required
+         
+      risk_list[[i]] <- data.frame(subject = data$subject,
+                                   predrisk = data$predrisk)
+      
+      perf_stats[i, ] <- c(auc_stats, se_auc_stats,
+                          cs_stats, se_cs_stats,
+                          OE_stats, se_OE_stats)
+      
+      colnames(perf_stats) <- c("AUC_stats", "se_AUC_stats",
+                                "cs_stats", "se_cs_stats",
+                                "OE_stats", "se_OE_stats")
+    }
+  
+  # Pool results
+  res_AUC <- pool_estimates(perf_stats[, "AUC_stats"], perf_stats[,"se_AUC_stats"], logit_trans = TRUE) #apply logit transformation
+  res_calslope <- pool_estimates(perf_stats[, "cs_stats"], perf_stats[, "se_cs_stats"])
+  res_OEratio <- pool_estimates(perf_stats[, "OE_stats"], perf_stats[,"se_OE_stats"], log_trans = TRUE) #apply log transformation
+  
+  risk_res <- do.call(rbind, risk_list) %>%
+      group_by(subject) %>%
+      dplyr::summarize(
+        predicted_risk = mean(predrisk))
+  
+  risk_df <- cbind(risk_res, time = data$time, eventbc = data$eventbc)
+  
+  res <- list(pooled_AUC = res_AUC,
+              pooled_CalSlope = res_calslope,
+              pooled_OEratio = res_OEratio,
+              pooled_risks = risk_df) #mean predicted risks
+  
+  return(res)
+}
+
+form1g7_res <- perf_g7(dat)
+form1g7_res[1:3]
+
+form1g7_riskdf <- form1g7_res$pooled_risks
+head(form1g7_riskdf)
+
+form1g7_nb_TP <- nb_fn_TP(data = form1g7_riskdf, tmax = tmax, thresholdmax = 0.2)
+form1g7_nb_TN <- nb_fn_TN(data = form1g7_riskdf, tmax = tmax, thresholdmax = 0.2)
+form1g7_TP <- cbind(threshold = form1g7_nb_TP$threshold, round(form1g7_nb_TP[,-1] * 1000000, 0))
+    #NB per 1000000 were exported in tables, otherwise low counts are produced and CBS rejects output request
+form1g7_TN <- cbind(threshold = form1g7_nb_TN$threshold, round(form1g7_nb_TN[,-1] * 1000000, 0))
+    #NB per 1000000 were exported in tables, otherwise low counts are produced and CBS rejects output request
+write_xlsx(form1g7_TP, "Data/form1g7_TP_per1000000.xlsx")
+write_xlsx(form1g7_TN, "Data/form1g7_TN_per1000000.xlsx")
+head(form1g7_nb_TP)
+head(form1g7_nb_TN)
+```
+
+# LRT
+```{r LRT}
+dat$wt <- 1/10
+
+# Calculate LRT
+  f1 <- coxph(Surv(time, eventbc) ~ offset(pirx), weight = wt, data = dat)
+  f2 <- coxph(Surv(time, eventbc) ~ offset(pi_g7), weight = wt, data = dat)
+
+  ll1 <- f1$loglik #partial likelihood
+  ll2 <- f2$loglik #partial likelihood
+  
+  ll.diff <- 2 * (ll2 - ll1) # LR = -2*(log-likelihood under reduced model - log-likelihood under full model) ~ asymptotic X2 distribution
+  chisq <- ll.diff
+  pval <- 1 - pchisq(ll.diff, df = 1)
+  res_LRT <- round(cbind(chisq, pval), 4)
+  res_LRT
+  
+  rm(f1, f2, ll1, ll2, ll.diff, chisq, pval)
+```
+
+# Plots {.tabset}
+## Validation plots (individual)
+```{r Valplot, fig.height=5.5, fig.width=5}
+# Calibration plot at 5 years
+  calplot_fn(data = form1g7_riskdf,
+          tmax = tmax,
+          main = "PREDICT-GS Calplot (N=3323)",
+          AUC = form1g7_res$pooled_AUC,
+          calslope = form1g7_res$pooled_CalSlope,
+          OEratio = form1g7_res$pooled_OEratio,
+          limit = 0.12,
+          size_lab = 1,
+          size_legend = 1,
+          size_bintext = 0.8,
+          line_bins = -0.02,
+          triangles = TRUE,
+          g = 5)
+```
+
+## Validation plots (combined)
+```{r Vaplot_com, fig.height=5.5, fig.width=5}
+# Calibration plots of original model (PREDICTv2.3) and extended model (PREDICT-GS)
+  calplot2df(data1 = form0_riskdf,
+             data2 = form1g7_riskdf,
+             tmax = tmax,
+             main = "Calibration plots combined",
+             limit = 0.11,
+             size_lab = 1,
+             size_legend = 0.8,
+             g = 5,
+             AUCdif = "= 0.05",
+             LRT = "< 0.05")
+```
+
+# Decision curve analysis
+```{r DCplot, fig.height=5, fig.width=7}
+# Plot decision curve analysis plot (TP) with smoothing
+  par(las = 1, xaxs = "i", yaxs = "i")
+  plot(form0_nb_TP$threshold,
+       form0_nb_TP$NB_all*1000,
+       type = "l", lwd = 3, lty = 1, col = "darkgray",
+       xlab = "Threshold probability", ylab = "Net TP benefit (per 1000)",
+       xlim = c(0, 0.16), ylim = c(-1, 5), bty = "n",
+       cex.lab = 1, cex.axis = 1)
+  smooth0 <- smooth.spline(form0_nb_TP$threshold, form0_nb_TP$NB*1000, spar=0.35)
+  lines(smooth0, type = "l", lwd = 3, col="black")
+  smooth1g7 <- smooth.spline(form0_nb_TP$threshold, form1g7_nb_TP$NB*1000, spar = 0.35)
+  lines(smooth1g7, type = "l", lwd = 3, col = "blue")
+  abline(h=0, col="black", lwd=1)
+  legend("topright", legend = c("Treat all", "PREDICTv2.3", "PREDICT-GS"),
+         lwd = 3, cex = 1, col = c("darkgray", "black", "blue"), bty = "n")
+  title("Decision Curve Analysis (N=3323)", adj = 0.5, cex = 1.5)
+  
+# Plot decision curve analysis plot (TN) with smoothing
+  par(las = 1, xaxs = "i", yaxs = "i")
+  plot(form0_nb_TN$threshold,
+       form0_nb_TN$NB_none*1000,
+       type = "l", lwd = 3, lty = 1, col = "darkgray",
+       xlab = "Threshold probability", ylab = "Net TN benefit (per 1000)",
+       xlim = c(0, 0.16), ylim = c(-1, 1000), bty = "n",
+       cex.lab = 1, cex.axis = 1)
+  smooth0 <- smooth.spline(form0_nb_TN$threshold, form0_nb_TN$NB*1000, spar=0.35)
+  lines(smooth0, type = "l", lwd = 3, col="black")
+  smooth1g7 <- smooth.spline(form0_nb_TN$threshold, form1g7_nb_TN$NB*1000, spar = 0.35)
+  lines(smooth1g7, type = "l", lwd = 3, col = "blue")
+  abline(h=0, col="black", lwd=1)
+  legend("topright", legend = c("Treat none", "PREDICTv2.3", "PREDICT-GS"),
+         lwd = 3, cex = 1, col = c("darkgray", "black", "blue"), bty = "n")
+  title("Decision Curve Analysis (N=3323)", adj = 0.5, cex = 1.5)
+  
+  rm(smooth0, smooth1g7)
+```
+
+# Net Benefit at specific thresholds
+```{r NB_at_thresholds}
+nb_at_thresholds_TP(nb_thresholds = c(0.030, 0.050, 0.100, 0.120, 0.150))
+nb_at_thresholds_TN(nb_thresholds = c(0.030, 0.050, 0.100, 0.120, 0.150))
+```
+
+# Sensitivity, specificity, PPV, NPV
+```{r Epimeasures}
+# For PREDICTv2.3
+form0 <- cbind(form0_nb_TP, form0_nb_TN[,-1])
+form0 <- form0 %>% select(threshold, TP, FP, TN, FN)
+form0 <- form0 %>% filter(threshold %in% seq(0.01, 0.20, by=0.01))
+
+form0$Orig_Sens <- round((form0$TP / (form0$TP + form0$FN))*100, 2)
+form0$Orig_Spec <- round((form0$TN / (form0$TN + form0$FP))*100, 2)
+form0$Orig_PPV <- round((form0$TP / (form0$TP + form0$FP))*100, 2)
+form0$Orig_NPV <- round((form0$TN / (form0$TN + form0$FN))*100, 2)
+
+form0 <- form0[,c("threshold", "Orig_Sens", "Orig_Spec", "Orig_PPV","Orig_NPV")]
+
+# For PREDICT-GS
+form1g7 <- cbind(form1g7_nb_TP, form1g7_nb_TN[,-1])
+form1g7 <- form1g7 %>% select(threshold, TP, FP, TN, FN)
+form1g7 <- form1g7 %>% filter(threshold %in% seq(0.01, 0.20, by=0.01))
+
+form1g7$Ext_Sens <- round((form1g7$TP / (form1g7$TP + form1g7$FN))*100, 2)
+form1g7$Ext_Spec <- round((form1g7$TN / (form1g7$TN + form1g7$FP))*100, 2)
+form1g7$Ext_PPV <- round((form1g7$TP / (form1g7$TP + form1g7$FP))*100, 2)
+form1g7$Ext_NPV <- round((form1g7$TN / (form1g7$TN + form1g7$FN))*100, 2)
+
+form1g7 <- form1g7[,c("threshold", "Ext_Sens", "Ext_Spec", "Ext_PPV","Ext_NPV")]
+
+Epimeasures <- cbind(form0, form1g7)
+
+write_xlsx(Epimeasures, "Data/Epimeasures_Sens_Spec_etc.xlsx")
+
+# save.image("WS_4_PREDICT-GS_validation.RData")
+```

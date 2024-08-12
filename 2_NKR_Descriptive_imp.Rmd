@@ -1,0 +1,155 @@
+---
+title: "Descriptive analysis on the imputed NKR dataset"
+author: "Mary Ann Binuya"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+  pdf_document: default
+---
+
+# Aim(s)
+1. To produce Table 1’s for the imputed NKR dataset
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = FALSE,
+  fig.retina = 3,
+  fig.path = "Output/2 NKR Descriptive Analysis/")
+
+#Load libraries
+library(dplyr) #for data manipulations
+library(survival) #for survival analysis
+library(table1) #for producing table 1's
+
+rm(list=ls())
+```
+
+# Load and format data for table
+```{r Load}
+load("WS_1_Data_Prep_NKR.RData")
+
+dat <- datapredimp_bc %>%
+  filter(.imp != 0) %>%
+  select(.imp,
+         time,
+         os,
+         oscr,
+         pirx,
+         mi,
+         age.start,
+         screen,
+         size,
+         grade,
+         nodes,
+         er,
+         pr,
+         her2,
+         ki67,
+         generation,
+         horm,
+         traz,
+         bis,
+         grisk,
+         eventbc,
+         eventoth) %>%
+  mutate(sizecat = case_when(
+      (size < 10) ~ 1,
+      (size <= 19) & (size >= 10) ~ 2,
+      (size > 19) ~ 3,
+      TRUE ~ NA),
+    agecat = ifelse(age.start >= 50, 1, 0))
+
+  rm(list = setdiff(ls(), c("dat")))
+
+# PREDICT predicted mortality at 5 years
+  tmax <- 5
+
+  brisk_bc <- exp(0.7424402 - 7.527762/sqrt(tmax) - 1.812513 * log(tmax)/sqrt(tmax)) #ER+ baseline cumhaz BC risk
+  bsurv_bc <- exp(-brisk_bc)
+  dat$bcss <- bsurv_bc^(exp(dat$pirx)) #BC survival 
+  
+  brisk_oth <- exp(-6.052919 + (1.079863 * log(tmax)) + (0.3255321 * tmax^0.5)) #baseline cumhaz other event
+  bsurv_oth <- exp(-brisk_oth)
+  dat$oths <- bsurv_oth^(exp(dat$mi)) #Other survival
+
+  dat$bcmort <- (1 - dat$bcss) * 100 #BC mortality
+  dat$othmort <- (1 - dat$oths) * 100 #other mortality
+
+# Additional formatting
+  dat$nodescat <- ifelse(dat$nodes > 4, 4, dat$nodes)
+  dat$nodescat <- as.factor(dat$nodescat)
+  dat$grade <- as.factor(dat$grade)
+  dat$oscr <- as.factor(dat$oscr)
+  dat$agecat <- as.factor(dat$agecat)
+  dat$sizecat <- as.factor(dat$sizecat)
+
+# Add levels
+  levels(dat$agecat) <- c("< 50 years", ">= 50 years")
+  levels(dat$screen) <- c("No or unknown", "Yes")
+  levels(dat$sizecat) <- c("< 10 mm", "10-19 mm", "> 19 mm")
+  levels(dat$grade) <- c("Well differentiated", "Moderately differentiated", "Poorly differentiated") #no undifferentiated
+  levels(dat$nodescat) <- c("Node-negative", "1 positive lymph node", "2 positive lymph nodes", "3 positive lymph nodes", "4+ positive lymph nodes")
+  levels(dat$pr) <- c("Negative", "Positive")
+  levels(dat$her2) <- c("Negative", "Positive")
+  #levels(dat$ki67) <- c("Unknown")
+  levels(dat$generation) <- c("No", "Second generation", "Third generation")
+  levels(dat$horm) <- c("No", "Yes")
+  levels(dat$traz) <- c("No", "Yes")
+  levels(dat$bis) <- c("No", "Yes")
+  levels(dat$grisk) <- c("Low", "High")
+  levels(dat$oscr) <- c("Alive", "Breast cancer death", "Other or unknown death")
+```
+
+# Table 1 (with predicted 5-year mortalities)
+```{r Table1_5yrs}
+labels_cr <- list(
+  variables = list(
+    agecat = "Age at diagnosis (years) - categorized",
+    age.start = "Age at diagnosis (years)",
+    screen = "Detected during screening",
+    sizecat = "Tumor size (mm) - categorized",
+    size = "Tumor size (mm)",
+    grade = "Tumor grade",
+    nodescat = "Number of positive nodes",
+    pr = "Progesterone status",
+    her2 = "HER2 status",
+    #ki67 = "Ki67 status",
+    generation = "Chemotherapy generation",
+    horm = "Hormone therapy",
+    traz = "Trastuzumab therapy",
+    bis = "Bisphosphonates",
+    grisk = "Genomic risk (MammaPrint)",
+    time = "Follow-up time (years)",
+    oscr = "Events",
+    bcmort = "PREDICT Predicted 5-year breast cancer mortality",
+    othmort = "PREDICT Predicted 5-year other mortality"),
+  groups = list(""))
+
+strata_cr <- c(list(Total = dat))
+
+table1(strata_cr, labels_cr, groupspan = c(1), #adjust groupspan if groups are indicated
+       render.continuous = c(. = "Mean (SD)", . = "Median [Q1, Q3]"),
+       data = dat, topclass = "Rtable1-zebra")
+```
+
+# Additional info: observed 5-year mortalities
+```{r Obsmort_5yrs}
+dat$wt <- 1/10 #rescale counts
+
+obs <- survfit(Surv(time, os) ~ 1, weight = wt, data = dat)
+summary(obs, times = 5, extend = T)$n.event #97 events at 5 years
+round(summary(obs, times = 5, extend = T)$n.event * 100/3323, 1) #2.9% of total (not at risk)
+
+obs_bc <- survfit(Surv(time, eventbc) ~ 1, weight = wt, data = dat)
+summary(obs_bc, times = 5, extend = T)$n.event #43 events at 5 years
+round(summary(obs_bc, times = 5, extend = T)$n.event * 100/3323, 1) #1.3% of total
+
+obs_oth <- survfit(Surv(time, eventoth) ~ 1, weight = wt, data = dat)
+summary(obs_oth, times = 5, extend = T)$n.event #54 events at 5 years
+round(summary(obs_oth, times = 5, extend = T)$n.event * 100/3323, 1) #1.6% of total
+```
+

@@ -1,0 +1,301 @@
+---
+title: "External validation of PREDICT v2.3 on the NKR dataset"
+author: "Mary Ann Binuya"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+  pdf_document: default
+---
+
+# Aims
+1. To externally validate PREDICT v2.3 (PREDICT with progesterone extension) on the imputed NKR dataset
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = FALSE,
+  fig.retina = 4,
+  fig.path = "Output/3 External Validation/")
+
+#Load libraries
+library(dplyr) #for data manipulations
+library(survival) #for survival analysis
+library(rms) #for survival analysis
+library(timeROC) #for timeAUC
+library(rsample) #for bootstrapping
+library(purrr) #for data manipulations
+library(writexl) #for exporting to excel
+library(mice) #for imputation-related functions
+
+rm(list=ls())
+```
+
+# Load data
+```{r Load}
+load("WS_1_Data_Prep_NKR.RData")
+
+dat <- datapredimp_bc %>%
+  filter(.imp!=0) %>%
+  select(.imp,
+         time, #Follow-up time
+         oscr, #Events: 1 = BC, 2 = Others/unknown
+         pirx, #Linear predictor BC death
+         screen, #Detected during screening
+         age.start, #Age at diagnosis
+         size, #Tumor size
+         grade, #Tumor grade
+         nodes, #Number of nodes
+         er, #ER status
+         pr, #Progesterone status
+         her2, #HER2 status
+         ki67, #Ki67 status
+         generation, #Chemotherapy generation
+         horm, #Hormone therapy
+         traz, #Trastuzumab (anti-HER2 therapy)
+         bis, #Bisphosphonates
+         grisk, #Genomic risk (MammaPrint)
+         eventbc) #Breast cancer death
+
+  rm(list=setdiff(ls(), c("dat", "imppred_bc")))
+  
+  table(dat$er, useNA="always") #confirm only ER+ patients
+  
+  nimp <- max(dat$.imp) #m=20 imputations
+  
+# PREDICT predicted breast cancer specific survival at 5 years
+  tmax <- 5
+  
+  bhaz_bc <- exp(0.7424402 - 7.527762/sqrt(tmax) - 1.812513*log(tmax)/sqrt(tmax)) #ER+ BC baseline cumhaz
+  bsurv_bc <- exp(-bhaz_bc) #S0 = exp(-cumhaz)
+  dat$bcss <- bsurv_bc^exp(dat$pirx)
+  
+# Load functions
+  source("Functions/pool_perf.R")
+```
+
+# 1 Check model performance at 5 years
+```{r Perfstats}
+# Calculate performance metrics for each imputed dataset
+  perf <- function (dataframe) { 
+    perf_stats <- matrix(NA, nimp, 6)
+    risk_list <- vector("list", nimp)
+  
+    for (i in 1:nimp) {
+    
+        data <- dat[dat[".imp"] == i, ]
+        data$subject <- seq_len(nrow(data))
+        
+        f <- coxph(Surv(time, eventbc) ~ pirx, x = TRUE, y = TRUE, data = data)
+        
+        # Discrimination
+        auc_temp <- timeROC(
+          T = data$time,
+          delta = data$oscr,
+          cause = 1,
+          marker = 1 - data$bcss, #assumes larger values = higher risk of events, without loss of generality
+          weighting = "marginal",
+          times = tmax,
+          iid = TRUE)
+        auc_stats <- as.numeric(auc_temp$AUC_2[2])
+              #here we use definition (ii) of controls, but results are very similar
+              #definition (ii) explicitly incorporates presence of competing risks other than event of interest
+              #it ensures that patients who are not cases (either because no event or other event)
+              #are correctly classified. See timeROC vignette for more details:
+                #definition (i): controls are strictly those without any event by time t
+                #definition (ii): controls include those without any event by time t and those with events other than event of interest
+        se_auc_stats <- as.numeric(auc_temp$inference$vect_sd_2[2])
+        
+        # Calibration slope
+        cs_stats <- f$coefficients
+        se_cs_stats <- sqrt(diag(vcov(f)))
+        
+        # Calibration-in-the-large
+          # Observed proportion at tmax
+          surv_fit <- survfit(Surv(data$time, data$eventbc) ~ 1)
+          obs_risk <- 1 - summary(surv_fit, times = tmax)$surv
+          obs_se <- summary(surv_fit, times = tmax)$std.err
+          obs_lrisk <- 1 - summary(surv_fit, times = tmax)$upper
+          obs_urisk <- 1 - summary(surv_fit, times = tmax)$lower
+          
+          # Predicted risk at tmax
+          data$predrisk <- 1 - data$bcss
+          exp_risk <- mean(data$predrisk)
+          
+          # O/E ratio
+          OE_stats <- obs_risk / exp_risk
+          se_OE_stats <- obs_se/obs_risk #if log transformation is required (see Debray et al, 2017 for formula)
+          #se_OE_stats <- obs_se / exp_risk #if log transformation not required
+        
+        risk_list[[i]] <- data.frame(subject = data$subject,
+                                     predrisk = data$predrisk)
+        
+        perf_stats[i, ] <- c(auc_stats, se_auc_stats,
+                             cs_stats, se_cs_stats,
+                             OE_stats, se_OE_stats)
+        
+        colnames(perf_stats) <- c(#"c_stats", "se_c_stats",
+                                  "auc_stats", "se_auc_stats",
+                                  "cs_stats", "se_cs_stats",
+                                  "OE_stats", "se_OE_stats")
+        }
+
+  # Pool results
+  res_AUC <- pool_estimates(perf_stats[, "auc_stats"], perf_stats[, "se_auc_stats"], logit_trans = TRUE) #apply logit transformation
+  res_calslope <- pool_estimates(perf_stats[, "cs_stats"], perf_stats[, "se_cs_stats"])
+  res_OEratio <- pool_estimates(perf_stats[, "OE_stats"], perf_stats[, "se_OE_stats"], log_trans = TRUE) #apply log transformation
+  
+  risk_res  <- do.call(rbind, risk_list) %>%
+      group_by(subject) %>%
+      dplyr::summarize(
+        predicted_risk = mean(predrisk))
+    
+  risk_df <- cbind(risk_res, time = data$time, event = data$eventbc)
+  
+  res <- list(pooled_AUC = res_AUC,
+              pooled_CalSlope = res_calslope,
+              pooled_OEratio = res_OEratio,
+              pooled_risks = risk_df)
+  
+  return(res)
+}
+
+NKR_res <- perf(dat)
+NKR_res[1:3]
+
+risk_df <- NKR_res$pooled_risks
+head(risk_df)
+```
+
+## 1.1 Validation plot
+```{r Valplot, fig.height=5.5, fig.width=5}
+# Calibration plot at 5 years
+  calplot_fn(data = risk_df,
+          tmax = tmax,
+          main = "PREDICT v2.3 Calplot (N=3323)",
+          AUC = NKR_res$pooled_AUC,
+          calslope = NKR_res$pooled_CalSlope,
+          OEratio = NKR_res$pooled_OEratio,
+          limit = 0.12,
+          size_lab = 1,
+          size_legend = 1,
+          size_bintext = 0.8,
+          line_bins = -0.02,
+          triangles = TRUE,
+          g = 5)
+```
+
+## 1.2 Net benefit and decision curve analysis plot
+```{r DCplot, fig.height=5, fig.width=7}
+# Calculate Net Benefit
+  form0_nb_TP <- nb_fn_TP(data = risk_df, tmax = tmax, thresholdmax = 0.2)
+  form0_nb_TN <- nb_fn_TN(data = risk_df, tmax = tmax, thresholdmax = 0.2)
+  form0_TP <- cbind(threshold = form0_nb_TP$threshold, round(form0_nb_TP[,-1]*1000000,0))
+    #NB per 1000000 were exported in tables, otherwise low counts are produced and CBS rejects output request
+  form0_TN <- cbind(threshold = form0_nb_TN$threshold, round(form0_nb_TN[,-1]*1000000,0))
+    #NB per 1000000 were exported in tables, otherwise low counts are produced and CBS rejects output request
+  write_xlsx(form0_TP, "Data/form0_TP_per1000000.xlsx")
+  write_xlsx(form0_TN, "Data/form0_TN_per1000000.xlsx")
+  head(form0_nb_TP)
+  head(form0_nb_TN)
+
+# Decision curve analysis plot (TP) with smoothing
+  par(las = 1, xaxs = "i", yaxs = "i")
+  plot(form0_nb_TP$threshold,
+       form0_nb_TP$NB_all*1000,
+       type = "l", lwd = 3, lty = 1, col = "darkgray",
+       xlab = "Threshold probability", ylab = "Net TP benefit (per 1000)",
+       xlim = c(0, 0.16), ylim = c(-1, 5), bty = "n",
+       cex.lab = 1, cex.axis = 1)
+  smooth0 <- smooth.spline(form0_nb_TP$threshold, form0_nb_TP$NB*1000, spar=0.35)
+  lines(smooth0, type = "l", lwd = 3, col="black")
+  abline(h=0, col="black", lwd=1)
+  legend("topright", legend = c("Treat all", "PREDICTv2.3"),
+         lty = c(1,1), lwd = 3, cex = 1, col = c("darkgray", "black"), bty = "n")
+  title("Decision Curve Analysis (N=3323)", adj = 0.5, cex = 1.5)
+  
+# Decision curve analysis plot (TN) with smoothing
+  par(las = 1, xaxs = "i", yaxs = "i")
+  plot(form0_nb_TN$threshold,
+       form0_nb_TN$NB_none*1000,
+       type = "l", lwd = 3, lty = 1, col = "darkgray",
+       xlab = "Threshold probability", ylab = "Net TN benefit (per 1000)",
+       xlim = c(0, 0.16), ylim = c(-1, 1000), bty = "n",
+       cex.lab = 1, cex.axis = 1)
+  smooth0 <- smooth.spline(form0_nb_TN$threshold, form0_nb_TN$NB*1000, spar=0.35)
+  lines(smooth0, type = "l", lwd = 3, col="black")
+  abline(h=0, col="black", lwd=1)
+  legend("bottomright", legend = c("Treat none", "PREDICTv2.3"),
+         lty = c(1,1), lwd = 3, cex = 1, col = c("darkgray", "black"), bty = "n")
+  title("Decision Curve Analysis (N=3323)", adj = 0.5, cex = 1.5)
+  
+  rm(smooth0)
+  
+# save.image("WS_3_PREDICT_validation.RData")
+```
+
+# 2 Check misspecification of PREDICT model for the NKR dataset
+## 2.1 Baseline cumulative hazard
+```{r Baseline, fig.height=5, fig.width=5}
+years <- 1:10
+
+# Calculate PREDICT baseline survival
+  bhaz_PREDICT <- exp(0.7424402 - 7.527762/sqrt(years) - 1.812513*log(years)/sqrt(years))
+  bsurv_PREDICT <- exp(-bhaz_PREDICT)
+  
+# Calculate NKR baseline survival
+  bsurv_NKR <- numeric(length(years))
+  
+  for (t in 1:length(years)) {
+    bhaz_t <- numeric(nimp)
+    for (i in 1:nimp) {
+      dat_i <- dat[dat$.imp == i, ]
+      fit <- coxph(Surv(time, eventbc) ~ offset(pirx), data = dat_i)
+      bhaz <- basehaz(fit)
+      bhaz_t[i] <- max(bhaz$hazard[bhaz$time <= years[t]]) #baseline cumhaz at time t
+    }
+    bsurv_NKR[t] <- exp(-mean(bhaz_t)) #mean baseline survival at time t
+  }
+
+# Plot
+  plot(years, bsurv_PREDICT, type = "l", lwd = 2,
+       xlab = "Years after diagnosis", ylab = "Baseline survival probability",
+       ylim = c(0.9, 1), xlim = c(min(years), max(years)), 
+       axes = FALSE)
+  axis(1, at = seq(min(years), max(years), by = 1))
+  axis(2, las = 2)
+  #polygon(c(years, rev(years)), c(bsurv_NKR_lower, rev(bsurv_NKR_upper)), #CIs could be obtained via bootstrapping, not necessary here
+  #        col = "grey", border = NA)
+  lines(years, bsurv_NKR, col = "black", lty = 2, lwd = 2)
+  legend("bottomleft", legend = c("Predicted (PREDICT)", "Observed (NKR)"),
+         col = c("black", "black"), lty = c(1, 2), lwd = c(2, 2), 
+         bty = "n", cex = 0.8)
+  box()
+
+# PREDICT underestimates baseline survival for NKR.
+  round((bsurv_NKR[5]-bsurv_PREDICT[5])*100, 1) #5 year difference
+  round((bsurv_NKR[10]-bsurv_PREDICT[10])*100, 1) #10 year difference
+``` 
+
+## 2.2 Predictor effects/prognostic index
+```{r Predeffects}
+fit_grisk <- imppred_bc %>% with(coxph(Surv(time, eventbc) ~ grisk))
+summary(pool(fit_grisk))
+
+fit_pirx <- imppred_bc %>% with(coxph(Surv(time, eventbc) ~ pirx))
+summary(pool(fit_pirx)) #effects, jointly appropriate for NKR
+
+fit_pirx_grisk <- imppred_bc %>% with(coxph(Surv(time, eventbc) ~ pirx + grisk))
+summary(pool(fit_pirx_grisk))
+
+fit_all <- imppred_bc %>% with(coxph(Surv(time, eventbc) ~ offset(pirx) +
+                                       age.start + size + grade + nodes + screen +
+                                       pr + her2 + generation + horm + traz + bis))
+summary(pool(fit_all)) #effect differences small
+
+fit_pirx <- imppred_bc %>% with(coxph(Surv(time, eventbc) ~ offset(pirx) + grisk))
+summary(pool(fit_pirx)) #as with MINDACT, not necessary to re-estimate coefs, just baseline component to address miscalibration-in-the-large
+```
+

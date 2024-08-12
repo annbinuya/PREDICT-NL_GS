@@ -1,0 +1,590 @@
+---
+title: "Preparing the NKR dataset"
+author: "Mary Ann Binuya"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+  pdf_document: default
+---
+
+# Aim(s)
+1. To confirm Netherlands Cancer Registry (NKR) data received meet study’s eligibility criteria
+2. To explore NKR data
+3. To prepare merged (NKR+CBS) data for analysis. CBS = Centraal Bureau voor de Statistiek, where cause of death are available.
+4. To impute missing data
+5. To run PREDICT v2.3 on imputed data
+6. To check significance of Mammaprint for predicting breast cancer and other/unknown mortality
+7. To check proportionality of hazards
+8. To check linearity of continuous variables
+9. Check interaction/effect modification of Mammaprint
+
+```{r setup, include=FALSE}
+#Set libpath
+#.libPaths(c("U:/libraries", .libPaths()))
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = TRUE,
+  warning = FALSE,
+  fig.retina = 3,
+  fig.path = "Output/1 Data Prep/")
+
+#Load libraries
+library(haven) #for data imports
+library(dplyr) #for data manipulations
+library(mice) #for imputations
+library(Hmisc) #for labeling
+library(survival) #for survival analysis
+library(cmprsk) #for competing risk analysis
+library(riskRegression) #for fgr
+library(lava) #for fgr
+library(prodlim) #for fgr
+
+rm(list=ls())
+```
+
+# 1. Load raw NKR data
+```{r DataloadNKR}
+datankr <- read_sav("H:/Analysis/Data/8945_K20298CBKV1.sav")
+
+# Confirm eligibility criteria
+  table(datankr$Gesl, useNA = "always") #confirm women only
+  table(datankr$Pre_mal, useNA = "always") #confirm no previous malignancies
+  table(!is.na(datankr$Incjr)) #confirm diagnosed with invasive BC
+  table(datankr$Chir, useNA = "always") #confirm underwent surgery
+  all.equal(datankr$Incjr, datankr$Jaarvg) #extra check: Incjr and Jaarvg have exactly the same values
+
+# All study-specific eligibility criteria met.
+```
+
+# 2. Explore NKR data
+```{r Explore}
+# Check distinct records
+  n_distinct(datankr$RINPERSOON) #some records come from the same identifier/ID (RINPERSOON) 
+  table(datankr$RINPERSOON == "") #few records have missing ID, ignore as cannot match with CBS
+  table(datankr$Jaarvg, useNA="always") #there are approx 15,000 patients with BC yearly. we have fewer, ~10,000 per year, because we requested women with early-stage unilateral breast cancer (BC)
+  
+# Explore records with same ID
+  datadup <- datankr %>%
+  group_by(RINPERSOON) %>% filter(n() > 1, RINPERSOON != "")
+  dim(datadup)[1] #only 2/28 records with repeated RINPERSOON (ID) had Mammaprint data. One repeat was a recurrence, not a first primary breast cancer (BC). We manually exclude this patient in the merging chunk below. The other repeat is handled in further data selection.
+  
+# Examine other data
+  names(select(datankr, contains("dat"))) #there are 3 date variables: "Geboortedatum" "Overlijdensdatum" "Peildatum"
+  table(datankr$Vitstat[datankr$Overlijdensdatum != "."], useNA = "always") #295 records with Vitstat=0 (alive) but with death date; use death date not Vitstat for events.
+
+  table(datankr$Oestrrec_stat, as.numeric(datankr$Oestrrec_uitslag), useNA = "always") #ER (estrogen receptor) uses 10% cutoff
+  table(datankr$Progrec_stat, as.numeric(datankr$Progrec_uitslag), useNA = "always") #PR (progesterone receptor) uses 10% cutoff
+  table(datankr$Mammaprint, datankr$Incjr, useNA = "always") #MammaPrint data was available only from 2011 onwards
+  table(datankr$Mammaprint, datankr$Oncotype, useNA = "always") #only four records with both MammaPrint and Oncotype data, not enough to do extra analysis
+```
+
+# 3. Select relevant predictors and records (NKR data)
+```{r Datasmall}
+# Select relevant variables
+  datankr_small <- datankr %>%
+    select(RINPERSOON, #identifier for CBS matching
+      Geboortedatum, #birth date
+      Peildatum, #reference/diagnosis date
+      Incjr, #year included
+      Overlijdensdatum, #death date
+      Perfstat, #performance status
+      Leeft, #age at diagnosis
+      Menopstatus, #menopausal status
+      Oestrrec_stat, #ER status
+      Progrec_stat, #PR status
+      Her2_uitslag, #HER2 status
+      ###Ki67 (no variable available, assume unknown)
+      Tumorgrootte, #tumor size
+      Diffgr, #tumor grade
+      Scrndetec, #tumor detected at screening
+      Lypos, #number of positive lymph nodes
+      starts_with('Chir_type'), #surgery type
+      Chemo, #chemotherapy
+      starts_with('Chemo_type'), #chemotherapy type
+      Horm, #hormone therapy
+      starts_with('Horm_type'), #hormone therapy type
+      starts_with('Horm_duur'), #hormone therapy length
+      Target, #targeted therapy
+      starts_with('Target_type'), #targeted therapy type
+      Rt, #radiotherapy
+      starts_with('Rt_type'), #radiotherapy type
+      ###Bisphosphonates (not available, assume based on menopausal status and age)
+      Mammaprint,
+      starts_with('Cci_'), #Comorbidity data including metastases
+      Pt, #pathological tumor size
+      Pn, #pathological node involvement
+      Pm, #pathological metastases
+      Stadiump, #pathological TNM stage
+      Meta1, Meta2, Meta3, Meta4, #metastases localization
+      Meta_ther, #therapy targeting metastasis
+      Meta_ther_type1, Meta_ther_type2, #type of therapy targeting metastasis
+      Sec_breast_andermal, #secondary breast tumor
+      Sec_andermal, #second primary tumor
+      starts_with('Sec_maltumorsoort'), #secondary tumor type
+      starts_with('Fu5y_rec'), starts_with('Fu10y_rec')) #events at follow-up including recurrence
+
+#Select relevant records
+  datankr_smallmp <- datankr_small %>% filter(Mammaprint %in% c('2', '3')) #with Mammaprint
+  dim(datankr_smallmp)[1] #3563 records
+  
+  datankr_smallER <- datankr_smallmp %>% filter(Oestrrec_stat=='1') #ER-positive, available for all
+  dim(datankr_smallER)[1] #3360 records
+  
+  datankr_smallsize <- datankr_smallER %>% filter(Tumorgrootte!=0) #size >0 (note: size=0 causes the linear predictor/prognostic index of PREDICT's breast cancer specific mortality submodel to be -Inf); retain missing tumor size for imputation
+  dim(datankr_smallsize)[1] #3350 records
+  
+  datankr_smallID <- datankr_smallsize %>% filter(!RINPERSOON %in% c('')) #with ID (needed for CBS matching)
+  dim(datankr_smallID)[1] #3324 records
+
+#Recode missing data
+  is.na(datankr_smallID) <- datankr_smallID==''
+  is.na(datankr_smallID$Tumorgrootte) <- datankr_smallID$Tumorgrootte=='999'
+  is.na(datankr_smallID$Progrec_stat) <- datankr_smallID$Progrec_stat=='9'
+  is.na(datankr_smallID$Lypos) <- datankr_smallID$Lypos=='98'
+  is.na(datankr_smallID$Diffgr) <- datankr_smallID$Diffgr=='9'
+  is.na(datankr_smallID$Overlijdensdatum) <- datankr_smallID$Overlijdensdatum=='.'
+
+#Reformat variables
+  datankr_formatted <- as.data.frame(unclass(datankr_smallID), stringsAsFactors=TRUE)
+  rm(list=setdiff(ls(), c('datankr_formatted', 'datankr')))
+  
+  datankr_formatted$Geboortedatum = as.Date(datankr_formatted$Geboortedatum, format='%Y%m%d')
+  datankr_formatted$Peildatum = as.Date(datankr_formatted$Peildatum, format='%Y%m%d')
+  datankr_formatted$Overlijdensdatum = as.Date(datankr_formatted$Overlijdensdatum, format='%Y%m%d')
+  
+  datankr_formatted$RINPERSOON <- as.character(datankr_formatted$RINPERSOON)
+  datankr_formatted$Leeft <- as.numeric(as.character(datankr_formatted$Leeft))
+  datankr_formatted$Tumorgrootte <- as.numeric(as.character(datankr_formatted$Tumorgrootte))
+  datankr_formatted$Lypos <- as.numeric(as.character(datankr_formatted$Lypos))
+  
+#Create event and time-to-event variables with cut-off: 2019-12-31
+
+  #Overall survival (OS)
+  datankr_formatted$os <- ifelse(datankr_formatted$Overlijdensdatum <= as.Date('2019-12-31'), 1, 0)
+  datankr_formatted$os[is.na(datankr_formatted$os)] <- 0
+  table(datankr_formatted$os, useNA='always')
+  
+  #Follow-up time OS (time) in years
+  datankr_formatted$time = ifelse(datankr_formatted$os==1,
+                                  round(as.numeric(difftime(datankr_formatted$Overlijdensdatum, datankr_formatted$Peildatum))/365.25,2),
+                                  round(as.numeric(difftime(as.Date('2019-12-31'), datankr_formatted$Peildatum))/365.25,2))
+```
+
+# 3. Load and prepare CBS data
+```{r DataloadCBS}
+# Link NKR with CBS data until end of 2019 (note: during analysis, CBS codes affected by COVID (2020 onwards) were still being finalized)
+  datacbsn011 <- read_sav("H:/Analysis/Data/DO2011V2.sav")
+  datacbsn012 <- read_sav("H:/Analysis/Data/130708_DO_2012V1.sav")
+    datacbsn011 <- datacbsn011 %>% select("rinpersoon", "ovljr", "primoorz")
+    datacbsn012 <- datacbsn012 %>% select("rinpersoon", "ovljr", "primoorz")
+    datacbs1 <- rbind(datacbsn011, datacbsn012)
+    datacbs1 <- datacbs1 %>% rename(RINPERSOON = rinpersoon, STATJAAR = ovljr, UCCODE = primoorz)
+    rm(list = ls(pattern = "datacbsn0"))
+    
+  datacbs2013 <- read_sav("H:/Analysis/Data/DOODOORZ2013TABV2.sav") #database more simplified from 2013 onwards
+  datacbs2014 <- read_sav("H:/Analysis/Data/DOODOORZ2014TABV1.sav")
+  datacbs2015 <- read_sav("H:/Analysis/Data/DOODOORZ2015TABV2.sav")
+  datacbs2016 <- read_sav("H:/Analysis/Data/DOODOORZ2016TABV2.sav")
+  datacbs2017 <- read_sav("H:/Analysis/Data/DOODOORZ2017TABV2.sav")
+  datacbs2018 <- read_sav("H:/Analysis/Data/DOODOORZ2018TABV2.sav")
+  datacbs2019 <- read_sav("H:/Analysis/Data/DOODOORZ2019TABV2.sav")
+    datacbs2 <- do.call("rbind", mget(ls(pattern = "ˆdatacbs20")))
+    rm(list = ls(pattern = "datacbs20"))
+    
+# Check redundant records
+  n_occur <- data.frame(table(datacbs2$RINPERSOON))
+  n_occur[n_occur$Freq > 1, ] #there are two redundant records
+    rm(n_occur)
+
+  ## Explore the two redundant records:
+    table(datacbs2$STATJAAR[datacbs2$RINPERSSON == "[deleted_ID1]"], datacbs2$UCCODE[datacbs2$RINPERSSON == "[deleted_ID1]"])
+      #recoded from R99 (ill-defined/unknown cause of mortality in 2015) to
+      #F03 (unspecified dementia in 2017)
+    table(datacbs2$STATJAAR[datacbs2$RINPERSSON == "[deleted_ID2]"], datacbs2$UCCODE[datacbs2$RINPERSSON == "[deleted_ID2]"])
+      #recoded from R99 (ill-defined/unknown cause of mortality in 2016) to
+      #C349 (malignant neoplasm of unspecified part of bronchus or lung in 2018)
+    
+# Select to reflect the most up-to-date death codes
+  datacbs2.uniq <- subset(datacbs2, !(RINPERSOON == "[deleted_ID1]" & UCCODE == "R99"))
+  datacbs2.uniq <- subset(datacbs2.uniq, !(RINPERSOON == "[deleted_ID2]" & UCCODE == "R99"))
+  
+  datacbs2.uniq2 <- data.frame(datacbs2.uniq) %>% select("RINPERSOON", "STATJAAR", "UCCODE")
+  
+  datacbs <- rbind(datacbs1, datacbs2.uniq2)
+```
+
+# 3. Combine NKR and CBS data, and explore data
+```{r Discrepancies}
+# Combine NKR and CBS data
+  datamerge <- left_join(datankr_formatted, datacbs, by = c(RINPERSOON = "RINPERSOON"))
+
+# Explore discrepancies between NKR and CBS data
+
+  ## 1 NKR death not in CBS (retain with unknown as cause of death)
+  datamerge$RINPERSOON[datamerge$os == 1 & is.na(datamerge$UCCODE)]
+
+    ### Check that it is not in original CBS databases
+    table(datacbs1$UCCODE[datacbs1$RINPERSOON == "[deleted_ID3]"], useNA = "always") #confirmed
+    table(datacbs2$UCCODE[datacbs2$RINPERSOON == "[deleted_ID3]"], useNA = "always") #confirmed
+
+  datamerge$UCCODE[datamerge$RINPERSOON == "[deleted_ID3]"] <- "R99" #retain record, with cause of death=unknown 
+
+  ## 2 CBS deaths not in NKR
+  datamerge$RINPERSOON[datamerge$os == 0 & !is.na(datamerge$UCCODE)]
+  
+    ### One record [deleted_ID4], very likely recurrence (see above notes on duplicate records), exclude
+    datamerge <- subset(datamerge, RINPERSOON != "[deleted_ID4]") #
+  
+    ### One record [deleted_ID5]: retain but add approximate death date (year) as only 2017 is indicated in CBS.
+    datamerge$os[datamerge$RINPERSOON == "[deleted_ID5]"] <- 1
+    
+    datamerge$Overlijdensdatum[datamerge$RINPERSOON == "[deleted_ID5]"] <- as.Date("2017-12-31") #approx death date
+    datamerge$time[datamerge$RINPERSOON == "[deleted_ID5]"] <- round(as.numeric(difftime(
+      datamerge$Overlijdensdatum[datamerge$RINPERSOON == "[deleted_ID5]"],
+      datamerge$Peildatum[datamerge$RINPERSOON == "[deleted_ID5]"]))/365.25, 2)
+    
+  rm(datacbs1, datacbs2, datacbs2.uniq, datacbs2.uniq2)
+
+# Unique causes of death
+  n_occur <- data.frame(table(datamerge$UCCODE[datamerge$os == 1]))
+  sum(n_occur$Freq) #145 deaths
+  n_occur[order(-n_occur$Freq), ] #49 unique ICD10 codes
+  rm(n_occur)
+  
+# Create event: competing risk
+  datamerge$oscr <- NA
+  datamerge$oscr <- ifelse(datamerge$os == 1 & datamerge$UCCODE == "C509", 1, ifelse(datamerge$os == 0, 0, 2)) #C509 = BC-related death
+  table(datamerge$oscr, useNA = "always")  #65 BC-related deaths overall
+  round(prop.table(table(datamerge$oscr, useNA = "always")) * 100, 1) 
+  table(datamerge$Mammaprint, datamerge$oscr, useNA = "always")
+```
+
+#3. Prepare combined data for imputation
+```{r Impprep}
+# Check format/reformat variables for imputation
+
+  ## grisk (MammaPrint/70-gene signature)
+  datamerge$grisk <- ifelse(datamerge$Mammaprint == 2, 0, 1)
+  datamerge$grisk <- as.factor(datamerge$grisk)
+  table(datamerge$grisk, useNA = "always")
+
+  ## grade
+  table(datamerge$Diffgr, useNA = "always") #grade not allowed to be unknown in PREDICT online tool, impute in a standard manner
+
+  ## her2
+  datamerge$her2 <- NA #her2 allowed to be unknown in PREDICT online tool and source code, but impute here nonetheless
+  datamerge$her2 <- ifelse(datamerge$Her2_uitslag == "3", 1,
+                           ifelse(datamerge$Her2_uitslag == "0" | datamerge$Her2_uitslag == "1", 0, datamerge$her2))
+  datamerge$her2 <- as.factor(datamerge$her2)
+  table(datamerge$her2, useNA = "always")
+
+  ## chemo generation
+  datamerge[, c("Chemo_type1", "Chemo_type2", "Chemo_type3")] <-
+    lapply(datamerge[, c("Chemo_type1", "Chemo_type2", "Chemo_type3")], as.character)
+  datamerge[, c("Chemo_type1", "Chemo_type2", "Chemo_type3")] <-
+    lapply(datamerge[, c("Chemo_type1", "Chemo_type2", "Chemo_type3")], function(x)
+      replace(x, grepl("426000|451000|452000|454000", x), 2))
+  datamerge[, c("Chemo_type1", "Chemo_type2", "Chemo_type3")] <-
+    lapply(datamerge[, c("Chemo_type1", "Chemo_type2", "Chemo_type3")], function(x)
+      replace(x, grepl("420000|421000|427000|466000|L01CD01|L01CD02", x), 3))
+  datamerge$generation <- pmax(datamerge$Chemo_type1, datamerge$Chemo_type2, datamerge$Chemo_type3, na.rm = TRUE)
+  datamerge$generation <- ifelse(is.na(datamerge$generation), 0, datamerge$generation)
+  datamerge$generation <- as.factor(datamerge$generation)
+  table(datamerge$Chemo, datamerge$generation, useNA = "always") #sanity check that chemo codes are appropriate
+  
+  ## horm
+  table(datamerge$Horm, useNA = "always") 
+
+  ## traz (trastuzumab/anti-her2 therapy)
+  datamerge$traz <- ifelse(datamerge$Target_type1 == "L01XC03" |
+                             datamerge$Target_type2 == "L01XC03" |
+                             datamerge$Target_type3 == "L01XC03", 1, 0)
+  datamerge$traz <- ifelse(is.na(datamerge$traz), 0, datamerge$traz)
+  table(datamerge$traz, useNA = "always")
+
+# Create other variables necessary for PREDICT risk calculation
+  
+  ## bisphophonates - derive based on menopausal status and age
+  datamerge$bis <- ifelse(datamerge$Menopstatus == "2" | datamerge$Menopstatus == "4", 1,
+                          ifelse(datamerge$Menopstatus == "1" | datamerge$Menopstatus == "3", 0,
+                                 ifelse(datamerge$Menopstatus == "9" & datamerge$Leeft > 50, "1", 0)))
+  datamerge$bis <- as.factor(datamerge$bis)
+  table(datamerge$bis, useNA = "always")
+  
+  ## ki67 - assume unknown for all
+  datamerge$ki67 <- 9
+  
+# Prepare final data
+  dataimp <- datamerge %>%
+    select(Leeft,
+           Scrndetec,
+           Tumorgrootte, Pt,
+           Diffgr,
+           Lypos, Pn,
+           Oestrrec_stat,
+           Progrec_stat,
+           her2,
+           ki67,
+           generation,
+           Horm,
+           traz,
+           bis,
+           grisk,
+           time,
+           os,
+           oscr) %>%
+  rename(age.start = Leeft,
+         screen = Scrndetec,
+         size = Tumorgrootte,
+         grade = Diffgr,
+         nodes = Lypos,
+         er = Oestrrec_stat,
+         pr = Progrec_stat,
+         horm = Horm)
+```
+
+# 4. Impute data - MICE imputation
+```{r Imp}
+# Check pattern of missingness
+  md.pattern(dataimp) #assume MAR; fraction of missing information: 144/3323 = ~5%, 10 imputations should be sufficient
+
+# Compute baseline cumhaz
+  dataimp$eventbc <- ifelse(dataimp$oscr == 1, 1, 0)
+  dataimp$eventoth <- ifelse(dataimp$oscr == 2, 1, 0)
+  
+  dataimp$cumhaz_bc <- nelsonaalen(dataimp, time, eventbc) # define marginal baseline cumhaz
+  dataimp$cumhaz_oth <- nelsonaalen(dataimp, time, eventoth) # define marginal baseline cumhaz
+
+# Imputation
+  ini <- mice(dataimp, maxit = 0, seed = 202309)
+  ini$nmis #number missing per variable: pr=2, her2=12, nodes=15, size=34, grade=81
+  
+  vis <- c("pr", "her2", "nodes", "size", "grade") #define order of imputation from lowest to highest number of missing
+  
+  method <- ini$method #check appropriate methods are used in imputation
+  method #pr=logreg, her2=logreg, nodes=pmm, size=pmm, grade=polyreg
+  
+  ## Retain as predictors: survival time, relevant status indicator, baseline cumhaz, and relevant covariates
+  pred_bc <- ini$predictorMatrix
+  pred_bc[, "bis"] <- 0 #derived variable
+  pred_bc[, "os"] <- 0
+  pred_bc[, "oscr"] <- 0 #retain eventbc
+  pred_bc[, "eventoth"] <- 0
+  pred_bc[, "cumhaz_oth"] <- 0 #retain cumhaz_bc
+  pred_bc #keep as predictors: 
+  
+  pred_oth <- ini$predictorMatrix
+  pred_oth[, "bis"] <- 0 #exclude, derived variable
+  pred_oth[, "os"] <- 0
+  pred_oth[, "oscr"] <- 0 #retain eventoth
+  pred_oth[, "eventbc"] <- 0
+  pred_oth[, "cumhaz_bc"] <- 0 #retain cumhaz_oth
+  pred_oth
+  
+  ## Constrain imputation of size and nodes ased on pathological size and nodes classification
+  post <- ini$post
+  post["size"] <- "
+  imp[[j]][data$Pt[!r[,j]] == '1A', i] <- squeeze(imp[[j]][data$Pt[!r[,j]] == '1A', i], c(0, 5))
+  imp[[j]][data$Pt[!r[,j]] == '1B', i] <- squeeze(imp[[j]][data$Pt[!r[,j]] == '1B', i], c(5, 10))
+  imp[[j]][data$Pt[!r[,j]] == '1C', i] <- squeeze(imp[[j]][data$Pt[!r[,j]] == '1C', i], c(10, 20))
+  imp[[j]][data$Pt[!r[,j]] == '2', i] <- squeeze(imp[[j]][data$Pt[!r[,j]] == '2', i], c(20, 50))
+  imp[[j]][data$Pt[!r[,j]] == '3', i] <- squeeze(imp[[j]][data$Pt[!r[,j]] == '3', i], c(50, 100))
+  imp[[j]][data$Pt[!r[,j]] == 'X', i] <- squeeze(imp[[j]][data$Pt[!r[,j]] == 'X', i], c(0, 100))"
+  post["nodes"] <- "
+  imp[[j]][data$Pn[!r[,j]] == '0S', i] <- squeeze(imp[[j]][data$Pn[!r[,j]] == '0S', i], c(0, 0))
+  imp[[j]][data$Pn[!r[,j]] == '2A', i] <- squeeze(imp[[j]][data$Pn[!r[,j]] == '2A', i], c(4, 9))
+  imp[[j]][data$Pn[!r[,j]] == 'X', i] <- squeeze(imp[[j]][data$Pn[!r[,j]] == 'X', i], c(0, 25))"
+  
+  ## Impute
+  imp_bc <- mice(dataimp, m = 10, method = method, visitSequence = vis, predictorMatrix = pred_bc, post = post, seed = 202309)
+  sapply(complete(imp_bc), function(x) sum(is.na(x))) #check no more missing
+  plot(imp_bc) #check convergence; convergence is better with m=10 than m=5; retain m=10.
+  densityplot(imp_bc, ~pr+her2 + nodes + size + grade) #check distribution of imputed values
+  
+  imp_oth <- mice(dataimp, m = 10, method = method, visitSequence = vis, predictorMatrix = pred_oth, post = post, seed = 202309)
+  sapply(complete(imp_oth), function(x) sum(is.na(x))) #check no more missing
+  plot(imp_oth) #check convergence is ok
+  densityplot(imp_oth, ~pr+her2 + nodes + size + grade)
+  
+rm(ini, pred_bc, pred_oth, post, method, vis)
+```
+
+#5. Run PREDICT on imputed dataset(s)
+```{r PREDICT}
+# Load PREDICT version 2.3 function
+  source("Functions/predictv23_batchrunner.R")
+
+# Run PREDICT on imp_bc
+  datapredimp_bc <- complete(imp_bc, action = "long", include = TRUE) # complete imputed data
+  
+  datapredimp_bc[, c("er", "pr", "her2", "ki67", "generation", "horm", "traz", "bis")] <-
+    as.numeric(as.matrix(datapredimp_bc[, c("er", "pr", "her2", "ki67", "generation", "horm", "traz", "bis")])) #format variables to accommodate PREDICT function; does not change any individual values
+  
+  datapredimp_bc <- ukpredict(datapredimp_bc, year = 5, age.start = age.start, screen = screen,
+                              size = size, grade = grade, nodes = nodes, er = er, pr = pr, her2 = her2, ki67 = ki67,
+                              generation = generation, horm = horm, traz = traz, bis = bis)
+  
+  datapredimp_bc[, c("er", "pr", "her2", "ki67", "generation", "horm", "traz", "bis")] <-
+    lapply(datapredimp_bc[, c("er", "pr", "her2", "ki67", "generation", "horm", "traz", "bis")], FUN = as.factor) #format variables back
+  
+  imppred_bc <- as.mids(datapredimp_bc)
+
+# Run PREDICT on imp_oth
+  datapredimp_oth <- complete(imp_oth, action = "long", include = TRUE) #complete imputed data
+  
+  datapredimp_oth[, c("er", "pr", "her2", "ki67", "generation", "horm", "traz", "bis")] <-
+    as.numeric(as.matrix(datapredimp_oth[, c("er", "pr", "her2", "ki67", "generation", "horm", "traz", "bis")])) #format variables to accommodate PREDICT function; does not change any individual values
+  
+  datapredimp_oth <- ukpredict(datapredimp_oth, year = 5, age.start = age.start, screen = screen,
+                               size = size, grade = grade, nodes = nodes, er = er, pr = pr, her2 = her2, ki67 = ki67,
+                               generation = generation, horm = horm, traz = traz, bis = bis)
+  
+  datapredimp_oth[, c("er", "pr", "her2", "ki67", "generation", "horm", "traz", "bis")] <-
+    lapply(datapredimp_oth[, c("er", "pr", "her2", "ki67", "generation", "horm", "traz", "bis")], FUN = as.factor) #format variables back
+  
+  imppred_oth <- as.mids(datapredimp_oth)
+  rm(list = setdiff(ls(), c("datapredimp_bc", "imppred_bc", "datapredimp_oth", "imppred_oth")))
+
+# save.image('WS_1_Data_Prep_NKR.RData')
+```
+
+# 6. To check significance of Mammaprint for predicting breast cancer and other/unknown mortality
+```{r Outcomes}
+# PREDICT considers two competing events in its calculation of overall survival: breast cancer and other mortality. We confirmed in MINDACT dataset that Mammaprint is only a significant predictor for breast cancer mortality. We confirm this again in the NKR dataset.
+
+# Cause-specific models:
+  ## Breast cancer
+  fit_bcss <- imppred_bc %>% with(coxph(Surv(time, eventbc) ~ grisk))
+  summary(pool(fit_bcss)) #MammaPrint (genomic risk) a significant predictor for breast cancer mortality, consistent with MINDACT results.
+  
+  fit_bcss_m <- imppred_bc %>%
+  with(coxph(Surv(time, eventbc) ~ offset(pirx) + grisk))
+  summary(pool(fit_bcss_m)) #significance retained adjusting for clinical risk (via PREDICT)
+    #grisk = 0.67, same effect as in MINDACT dataset
+  
+  fit_bcss_m <- imppred_bc %>%
+  with(coxph(Surv(time, eventbc) ~ pirx + grisk))
+  summary(pool(fit_bcss_m)) #significance retained adjusting for clinical risk (via PREDICT)
+
+  ## Other
+  fit_oth <- imppred_oth %>% with(coxph(Surv(time, eventoth) ~ grisk))
+  summary(pool(fit_oth)) #MammaPrint (genomic risk) NOT a significant predictor for other/unknown mortality, consistent with MINDACT results.
+  
+  fit_oth_m <- imppred_oth %>% with(coxph(Surv(time, eventoth) ~ mi + grisk))
+  summary(pool(fit_oth_m)) #still NOT a significant predictor after adjustment for PREDICT other-mortality specific prognostic index
+
+  rm(list = ls(pattern = "ˆfit"))
+
+# Sanity check using subdistribution hazard models
+  ## Breast cancer
+  fgr_res <- fgr_res_m <- list()
+
+  for (i in 1:10) {
+    df <- datapredimp_bc %>% filter(.imp == i)
+    fgr_bcss <- FGR(Hist(time, oscr) ~ grisk, cause = 1, data = df)
+    fgr_res[[i]] <- summary(fgr_bcss)$coef
+    fgr_bcss_m <- FGR(Hist(time, oscr) ~ pirx + grisk, cause = 1, data = df)
+    fgr_res_m[[i]] <- summary(fgr_bcss_m)$coef
+    }
+
+  fgr_res #similar result as cause-specific model
+  fgr_res_m #similar result as cause-specific model
+  
+  rm(list = ls(pattern = "ˆfgr"))
+  
+  ## Other
+  fgr_res <- fgr_res_m <- list()
+  
+  for (i in 1:10) {
+    df <- datapredimp_bc %>%
+      filter(.imp == i)
+      fgr_oths <- FGR(Hist(time, oscr) ~ grisk, cause = 2, data = df)
+      fgr_res[[i]] <- summary(fgr_oths)$coef
+      fgr_oths_m <- FGR(Hist(time, oscr) ~ mi + grisk, cause = 2, data = df)
+      fgr_res_m[[i]] <- summary(fgr_oths_m)$coef
+      }
+
+  fgr_res #similar result as cause-specific model
+  fgr_res_m #similar result as cause-specific model
+
+  rm(list = ls(pattern = "^fgr"))
+  rm(df)
+  
+# Limit analysis to prediction of prediction of breast cancer mortality.
+```
+
+# 7. Check proportionality of hazards
+```{r PH}
+zph <- zph_full <- list()
+
+for (i in 1:10) {
+  dat <- datapredimp_bc %>%
+    filter(.imp == i) %>%
+    select(time, eventbc,
+           grisk, pirx, age.start, size, grade, nodes, pr, her2, generation, horm, traz, bis)
+
+  fit_bc <- coxph(Surv(time, eventbc) ~ grisk, data = dat)
+  res <- cox.zph(fit_bc, transform = "identity")
+  zph[[i]] <- res
+  
+  fit_bc_full <- coxph(Surv(time, eventbc) ~ ., data = dat) #include all covariates
+  res_full <- cox.zph(fit_bc_full, transform = "identity")
+  zph_full[[i]] <- res_full
+}
+
+rand <- sample(1:10, 1) #show result only of the ith random imputed data
+
+zph[[rand]] #grisk hazard is proportional over time grisk P=0.22, global P=0.22 
+zph_full[[rand]] #grisk hazard is proportional over time grisk P=0.18, pirx=0.50, global P=0.42 
+plot(res_full, resid = FALSE)
+
+  rm(list = ls(pattern = "^fit"))
+  rm(list = ls(pattern = "^zph"))
+  rm(list = ls(pattern = "^res"))
+  rm(i, rand)
+
+# Based on the Schoenfeld test, the PH assumption holds for MammaPrint/genomic risk (grisk), PREDICT's prognostic index (pirx), and other covariates relevant for prediction of risk for breast cancer mortality.
+```
+
+# 8. Check linearity of continuous variables
+```{r Lin}
+# To assess linearity, we fit a linear and non-linear term and check their significance. We do this using pspline() in coxph.
+
+fit_pirx <- imppred_bc %>% with(coxph(Surv(time, eventbc) ~ pspline(pirx))) #if df=0 is specified, pspline will choose the best df based on AIC
+summary(fit_pirx) #linear
+
+  rm(list = ls(pattern = "^fit"))
+```
+
+# 9. Check interaction/effect modification of Mammaprint
+```{r Effectmodification}
+fit_gpirx <- imppred_bc %>% with(coxph(Surv(time, eventbc) ~ grisk * pirx))
+summary(pool(fit_gpirx))  #no significant interaction
+
+fit_gage <- imppred_bc %>% with(coxph(Surv(time, eventbc) ~ grisk * age.start))
+summary(pool(fit_gage))  #some interaction but not statistically significant at alpha=5%
+
+fit_gscreen <- imppred_bc %>% with(coxph(Surv(time, eventbc) ~ grisk * screen))
+summary(pool(fit_gscreen))  #no significant interaction
+
+fit_gsize <- imppred_bc %>% with(coxph(Surv(time, eventbc) ~ grisk * size))
+summary(pool(fit_gsize))  #no significant interaction
+
+fit_ggrade <- imppred_bc %>% with(coxph(Surv(time, eventbc) ~ grisk * grade))
+summary(pool(fit_ggrade))  #no significant interaction
+
+fit_gnodes <- imppred_bc %>% with(coxph(Surv(time, eventbc) ~ grisk * nodes))
+summary(pool(fit_gnodes))  #no significant interaction
+
+fit_gpr <- imppred_bc %>% with(coxph(Surv(time, eventbc) ~ grisk * pr))
+summary(pool(fit_gpr))  #no significant interaction
+
+fit_gher2 <- imppred_bc %>% with(coxph(Surv(time, eventbc) ~ grisk * her2))
+summary(pool(fit_gher2))  #no significant interaction, but too few patients in HER2+ due to selection
+
+  rm(list = ls(pattern = "^fit"))
+```
+
