@@ -13,6 +13,7 @@ The prognostic effect of 70-GS was obtained from the MINDACT study (for details,
 | 3_PREDICTv23_validation.Rmd        | Validation of the PREDICTv2.3 model.
 | 4_PREDICT-GS_validation.Rmd        | Validation of the PREDICT-GS model.
 | 5_PREDICT_P-O.Rmd                  | Observed and predicted events at 5 years.
+| pool_perf.R                        | Pooling function and other functions used.
 
 # Contact
 Mary Ann E. Binuya <br/>
