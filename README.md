@@ -29,7 +29,7 @@ Netherlands Cancer Institute <br/>
 | Coralie Poncet    | Author | Review  |
 | Emiel Rutgers     | Author | Review  |
 | Martine Piccart   | Author | Review  |
-| Fatima Cargoso    | Author | Review  |
+| Fatima Cardoso    | Author | Review  |
 | Laura van 't Veer | Author | Review  |
 | Ewout Steyerberg  | Author | Development and review  |
 | Sabine Linn       | Author | Development and review  |
